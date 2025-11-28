@@ -1,0 +1,185 @@
+name: 🚀 XServer VPS 自动续期
+
+on:
+  schedule:
+    # 每72小时运行一次（每3天的 00:00 UTC，即北京时间 08:00）
+    - cron: '0 0 */3 * *'
+  
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: '🔄 强制执行（忽略缓存）'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  renewal:
+    name: 🔄 执行续期任务
+    runs-on: ubuntu-latest
+    
+    # ========== 🔧 关键：添加 FlareSolverr 服务容器 ==========
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        env:
+          LOG_LEVEL: info
+          CAPTCHA_SOLVER: none
+    
+    steps:
+      # ========== 📦 准备阶段 ==========
+      
+      - name: 📥 检出代码仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🐍 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 安装 Python 依赖
+        run: |
+          echo "📦 正在安装 Python 依赖..."
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          echo "✅ Python 依赖安装完成"
+
+      - name: 🌐 安装 Playwright 浏览器
+        run: |
+          echo "🌐 正在安装 Chromium 浏览器..."
+          playwright install chromium
+          playwright install-deps chromium
+          echo "✅ 浏览器安装完成"
+
+      # ========== 🧪 测试 FlareSolverr 连接 ==========
+      - name: 🔍 测试 FlareSolverr 服务
+        run: |
+          echo "🔍 测试 FlareSolverr 连接..."
+          max_retries=10
+          retry_count=0
+          
+          while [ $retry_count -lt $max_retries ]; do
+            if curl -s http://localhost:8191/v1 > /dev/null; then
+              echo "✅ FlareSolverr 服务已就绪"
+              curl -X POST http://localhost:8191/v1 \
+                -H "Content-Type: application/json" \
+                -d '{"cmd":"sessions.list"}' | python3 -m json.tool
+              break
+            fi
+            
+            retry_count=$((retry_count + 1))
+            echo "⏳ 等待 FlareSolverr 启动... ($retry_count/$max_retries)"
+            sleep 3
+          done
+          
+          if [ $retry_count -eq $max_retries ]; then
+            echo "❌ FlareSolverr 启动失败"
+            exit 1
+          fi
+
+      # ========== 🚀 执行阶段 ==========
+      
+      - name: 🎯 运行续期脚本
+        env:
+          # 🔐 账号信息
+          XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
+          XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
+          XSERVER_VPS_ID: ${{ secrets.XSERVER_VPS_ID }}
+          
+          # 🔧 FlareSolverr 配置（使用本地服务）
+          FLARESOLVERR_URL: 'http://localhost:8191/v1'
+          
+          # 🤖 验证码识别 API
+          CAPTCHA_API_URL: ${{ secrets.CAPTCHA_API_URL }}
+          
+          # 📱 Telegram 通知
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          
+          # ⚙️ 运行配置
+          USE_HEADLESS: 'true'   # ★ 改回 true - 不再需要 Xvfb
+          WAIT_TIMEOUT: '30000'
+        run: |
+          echo "🚀 开始执行 XServer VPS 自动续期任务..."
+          echo "⏰ 执行时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📋 配置检查:"
+          if [ -n "$XSERVER_EMAIL" ]; then echo "  ✅ XSERVER_EMAIL: 已配置"; else echo "  ❌ XSERVER_EMAIL: 未配置"; fi
+          if [ -n "$XSERVER_PASSWORD" ]; then echo "  ✅ XSERVER_PASSWORD: 已配置"; else echo "  ❌ XSERVER_PASSWORD: 未配置"; fi
+          if [ -n "$XSERVER_VPS_ID" ]; then echo "  ✅ XSERVER_VPS_ID: $XSERVER_VPS_ID"; else echo "  ❌ XSERVER_VPS_ID: 未配置"; fi
+          if [ -n "$CAPTCHA_API_URL" ]; then echo "  ✅ CAPTCHA_API_URL: 已配置"; else echo "  ⚠️ CAPTCHA_API_URL: 未配置"; fi
+          if [ -n "$FLARESOLVERR_URL" ]; then echo "  ✅ FlareSolverr: $FLARESOLVERR_URL"; else echo "  ❌ FlareSolverr: 未配置"; fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          if [ ! -f "renewal.py" ]; then
+            echo "❌ 错误: 找不到 renewal.py 文件"
+            exit 1
+          fi
+
+          echo "📂 当前目录: $(pwd)"
+          ls -lh renewal.py
+          
+          python3 renewal.py
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ 续期任务执行完成"
+
+      # ========== 📊 结果处理 ==========
+      
+      - name: 📊 显示运行结果
+        if: always()
+        run: |
+          echo "📊 ========== 运行结果摘要 =========="
+          if [ -f "README.md" ]; then cat README.md; fi
+          echo ""
+          if [ -f "cache.json" ]; then cat cache.json | python3 -m json.tool; fi
+          echo ""
+          echo "📝 最新日志:"
+          if [ -f "renewal.log" ]; then tail -n 100 renewal.log; fi
+
+      - name: 📦 上传运行日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renewal-logs-${{ github.run_number }}
+          path: |
+            renewal.log
+            *.png
+            cache.json
+          retention-days: 30
+
+      - name: 💾 提交状态更新
+        if: always()
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "GitHub Actions Bot 🤖"
+          [ -f "README.md" ] && git add README.md
+          [ -f "cache.json" ] && git add cache.json
+          if git diff --staged --quiet; then
+            echo "ℹ️ 无需提交"
+          else
+            git commit -m "🔄 状态更新 [skip ci]"
+            git push
+          fi
+
+  stats:
+    name: 📈 显示统计信息
+    runs-on: ubuntu-latest
+    needs: renewal
+    if: always()
+    steps:
+      - name: 📊 运行统计
+        run: |
+          echo "📈 ========== XServer VPS 续期统计 =========="
+          echo "🔢 运行次数: #${{ github.run_number }}"
+          echo "⏰ 执行时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
