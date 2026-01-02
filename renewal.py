@@ -6,6 +6,7 @@ XServer VPS 自动续期脚本（增强版）
 - 优化：Cloudflare Turnstile 验证处理顺序
 - 改进：强制关闭无头模式 + 注入 anti-bot 脚本 + 增强“人类行为”模拟
 - 新增：自动判断是否已续期 / 尚未到可续期日期（按 JST），避免重复续期
+- 新增：Playwright 原生 proxy 参数 + 出口 IP 校验（代理未生效则中断，防止触发邮箱验证）
 """
 
 import asyncio
@@ -16,6 +17,7 @@ import os
 import json
 import logging
 from typing import Optional, Dict
+from urllib.parse import urlparse, unquote
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
@@ -44,6 +46,9 @@ class Config:
 
     # 仅支持带 schema 的简单代理，如 socks5://ip:port 或 http://ip:port
     PROXY_SERVER = os.getenv("PROXY_SERVER")
+
+    # GitHub Runner 的出口 IP（用于判断代理是否生效）
+    RUNNER_IP = os.getenv("RUNNER_IP")
 
     CAPTCHA_API_URL = os.getenv(
         "CAPTCHA_API_URL",
@@ -192,6 +197,29 @@ class XServerVPSRenewal:
 
         self.captcha_solver = CaptchaSolver()
 
+    # ---------- 工具：解析代理 ----------
+    def _build_playwright_proxy(self, proxy_url: str) -> Dict:
+        """
+        将 PROXY_SERVER 转换为 Playwright proxy dict。
+        支持：
+          - socks5://user:pass@host:port
+          - http://user:pass@host:port
+          - socks5://host:port
+        """
+        p = urlparse(proxy_url)
+        if not p.scheme or not p.hostname or not p.port:
+            raise ValueError("PROXY_SERVER 格式错误，必须形如 socks5://user:pass@host:port")
+
+        server = f"{p.scheme}://{p.hostname}:{p.port}"
+        proxy: Dict[str, str] = {"server": server}
+
+        if p.username is not None:
+            proxy["username"] = unquote(p.username)
+        if p.password is not None:
+            proxy["password"] = unquote(p.password)
+
+        return proxy
+
     # ---------- 缓存 ----------
     def load_cache(self) -> Optional[Dict]:
         if os.path.exists("cache.json"):
@@ -239,25 +267,29 @@ class XServerVPSRenewal:
                 "--start-maximized",
             ]
 
-            # 代理（只支持简单 proxy-server 写法）
-            proxy_url = None
-            if Config.PROXY_SERVER:
-                proxy_url = Config.PROXY_SERVER
-                logger.info(f"🌐 使用代理: {Config.PROXY_SERVER}")
-
             # 强制关闭无头模式
             if Config.USE_HEADLESS:
                 logger.info("⚠️ 为了通过 Turnstile，强制使用非无头模式(headless=False)")
             else:
                 logger.info("ℹ️ 已配置非无头模式(headless=False)")
 
-            if proxy_url:
-                launch_args.append(f"--proxy-server={proxy_url}")
-
             launch_kwargs = {
                 "headless": False,   # ★ 关键：强制关闭 headless
                 "args": launch_args
             }
+
+            # ✅ 使用 Playwright 原生 proxy 参数（更稳，尤其带账号密码）
+            if Config.PROXY_SERVER:
+                try:
+                    proxy = self._build_playwright_proxy(Config.PROXY_SERVER)
+                    launch_kwargs["proxy"] = proxy
+                    logger.info("🌐 已配置代理（PROXY_SERVER 已设置）")
+                except Exception as e:
+                    logger.error(f"❌ 代理配置解析失败: {e}")
+                    self.error_message = f"代理配置解析失败: {e}"
+                    return False
+            else:
+                logger.info("ℹ️ 未配置代理（PROXY_SERVER 未设置）")
 
             self.browser = await self._pw.chromium.launch(**launch_kwargs)
 
@@ -295,8 +327,32 @@ Object.defineProperty(navigator, 'permissions', {
             else:
                 logger.info("ℹ️ 使用新版 playwright_stealth 或未安装,跳过 stealth 处理")
 
+            # === 🔍 代理生效检测：输出出口 IP，并在代理失效时中断（防邮箱验证） ===
+            try:
+                await self.page.goto("https://api.ipify.org", timeout=15000)
+                browser_ip = (await self.page.evaluate("() => document.body.innerText")).strip()
+                logger.info(f"🌐 浏览器出口 IP: {browser_ip}")
+
+                if Config.RUNNER_IP:
+                    logger.info(f"🌍 GitHub Runner 出口 IP: {Config.RUNNER_IP}")
+
+                # 配置了代理 + 提供了 Runner IP + 两者相同 => 代理未生效
+                if Config.PROXY_SERVER and Config.RUNNER_IP and browser_ip == Config.RUNNER_IP:
+                    msg = (
+                        "检测到代理未生效：浏览器出口 IP 与 GitHub Runner IP 相同，"
+                        "为避免触发邮箱验证，已中断续期。"
+                    )
+                    logger.error(f"❌ {msg} (browser_ip={browser_ip}, runner_ip={Config.RUNNER_IP})")
+                    self.error_message = f"{msg} (browser_ip={browser_ip}, runner_ip={Config.RUNNER_IP})"
+                    return False
+
+            except Exception as e:
+                # 获取 IP 失败时不强制中断（避免 ipify 波动导致完全跑不了）
+                logger.warning(f"⚠️ 无法获取出口 IP（将跳过代理强校验）: {e}")
+
             logger.info("✅ 浏览器初始化成功")
             return True
+
         except Exception as e:
             logger.error(f"❌ 浏览器初始化失败: {e}")
             self.error_message = str(e)
@@ -480,7 +536,6 @@ Object.defineProperty(navigator, 'permissions', {
         try:
             logger.info("🔐 开始 Cloudflare Turnstile 验证流程...")
 
-            # 检查是否有 Turnstile
             has_turnstile = await self.page.evaluate("""
                 () => {
                     return document.querySelector('.cf-turnstile') !== null;
@@ -493,7 +548,7 @@ Object.defineProperty(navigator, 'permissions', {
 
             logger.info("🔍 检测到 Turnstile,尝试多种方法触发验证...")
 
-            # 方法1: 获取 iframe 并尝试坐标点击
+            # 方法1: 坐标点击 iframe
             try:
                 await asyncio.sleep(3)
 
@@ -530,7 +585,7 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception as e:
                 logger.info(f"ℹ️ 方法1 失败: {e}")
 
-            # 方法2: 使用 CDP 注入脚本到所有 frame
+            # 方法2: CDP 注入点击
             try:
                 logger.info("🔧 方法2: 使用 CDP 注入到所有 frames...")
 
@@ -584,7 +639,7 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception as e:
                 logger.info(f"ℹ️ 方法2 失败: {e}")
 
-            # 方法3: 模拟真实用户鼠标移动 + 点击
+            # 方法3: 模拟鼠标移动 + 点击
             try:
                 logger.info("🖱️ 方法3: 模拟真实用户鼠标移动...")
 
@@ -624,7 +679,7 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception as e:
                 logger.info(f"ℹ️ 方法3 失败: {e}")
 
-            # 再顺带模拟一些页面滚动，增强“人类行为”
+            # 滚动增强“人类行为”
             try:
                 await self.page.mouse.move(200, 200, steps=20)
                 await asyncio.sleep(0.4)
@@ -635,7 +690,6 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception:
                 pass
 
-            # 等待验证完成
             logger.info("⏳ 等待 Turnstile 验证完成...")
 
             for i in range(max_wait):
@@ -652,7 +706,6 @@ Object.defineProperty(navigator, 'permissions', {
                         const container = document.querySelector('.cf-turnstile');
                         let hasCheckmark = false;
                         if (container) {
-                            const computedStyle = window.getComputedStyle(container);
                             hasCheckmark = container.classList.contains('success') ||
                                            container.classList.contains('verified') ||
                                            container.querySelector('[aria-checked="true"]') !== null;
@@ -679,7 +732,7 @@ Object.defineProperty(navigator, 'permissions', {
                     return True
 
                 if i % 20 == 10:
-                    logger.info(f"🔄 重新尝试所有触发方法... ({i}/{max_wait}秒)")
+                    logger.info(f"🔄 重新尝试触发点击... ({i}/{max_wait}秒)")
                     try:
                         iframe_info = await self.page.evaluate("""
                             () => {
@@ -741,7 +794,6 @@ Object.defineProperty(navigator, 'permissions', {
             logger.info("📄 开始提交续期表单")
             await asyncio.sleep(3)
 
-            # 在续期页面先模拟一些“人类行为”
             logger.info("👤 在续期页面模拟用户行为以辅助 Turnstile 通过...")
             try:
                 await self.page.mouse.move(50, 50, steps=25)
@@ -755,16 +807,13 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception:
                 pass
 
-            # 步骤 1: Turnstile
             logger.info("🔐 步骤1: 完成 Cloudflare Turnstile 验证...")
             turnstile_success = await self.complete_turnstile_verification(max_wait=90)
-
             if not turnstile_success:
                 logger.warning("⚠️ Turnstile 验证未完全确认,但继续尝试提交...")
 
             await asyncio.sleep(2)
 
-            # 步骤 2: 获取并识别验证码图片
             logger.info("🔍 步骤2: 查找验证码图片...")
             img_data_url = await self.page.evaluate("""
                 () => {
@@ -795,7 +844,6 @@ Object.defineProperty(navigator, 'permissions', {
                 self.error_message = "验证码识别失败"
                 return False
 
-            # 步骤 3: 填写验证码
             logger.info(f"⌨️ 步骤3: 填写验证码: {code}")
             input_filled = await self.page.evaluate("""
                 (code) => {
@@ -818,7 +866,6 @@ Object.defineProperty(navigator, 'permissions', {
             await asyncio.sleep(2)
             await self.shot("09_captcha_filled")
 
-            # 再模拟少量鼠标行为
             try:
                 await self.page.mouse.move(270, 300, steps=30)
                 await asyncio.sleep(0.9)
@@ -827,7 +874,6 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception:
                 pass
 
-            # 步骤 4: 最终确认 Turnstile 令牌
             logger.info("🔍 步骤4: 最终确认 Turnstile 令牌...")
             final_check = await self.page.evaluate("""
                 () => {
@@ -851,7 +897,6 @@ Object.defineProperty(navigator, 'permissions', {
 
             await asyncio.sleep(1)
 
-            # 步骤 5: 提交表单
             logger.info("🖱️ 步骤5: 提交表单...")
             await self.shot("10_before_submit")
 
@@ -883,7 +928,6 @@ Object.defineProperty(navigator, 'permissions', {
 
             html = await self.page.content()
 
-            # 错误提示
             if any(err in html for err in [
                 "入力された認証コードが正しくありません",
                 "認証コードが正しくありません",
@@ -896,7 +940,6 @@ Object.defineProperty(navigator, 'permissions', {
                 self.error_message = "验证码错误或 Turnstile 验证失败"
                 return False
 
-            # 成功提示
             if any(success in html for success in [
                 "完了",
                 "継続",
@@ -905,7 +948,6 @@ Object.defineProperty(navigator, 'permissions', {
             ]):
                 logger.info("🎉 续期成功")
                 self.renewal_status = "Success"
-                # 再查一次新的到期日期
                 await self.get_expiry()
                 self.new_expiry_time = self.old_expiry_time
                 return True
@@ -978,102 +1020,20 @@ Object.defineProperty(navigator, 'permissions', {
             # 3. 获取当前到期时间
             await self.get_expiry()
 
-            # 3.5 自动判断是否已经续期 / 是否到可续期日（按 JST）
+            # 3.5 自动判断是否到可续期日（按 JST）
             try:
                 if self.old_expiry_time:
-                    # 使用 JST 当前日期
                     today_jst = datetime.datetime.now(timezone(timedelta(hours=9))).date()
-                    expiry_date = datetime.datetime.strptime(
-                        self.old_expiry_time, "%Y-%m-%d"
-                    ).date()
+                    expiry_date = datetime.datetime.strptime(self.old_expiry_time, "%Y-%m-%d").date()
                     can_extend_date = expiry_date - datetime.timedelta(days=1)
 
                     logger.info(f"📅 今日日期(JST): {today_jst}")
                     logger.info(f"📅 到期日期: {expiry_date}")
                     logger.info(f"📅 可续期开始日: {can_extend_date}")
 
-                    # 规则：只有“到期前 1 天”起才能续期
                     if today_jst < can_extend_date:
-                        # 说明现在离可续期日还早（或者已经续过期，日期被推迟）
                         logger.info("ℹ️ 当前 VPS 尚未到可续期时间，无需续期。")
                         self.renewal_status = "Unexpired"
                         self.error_message = None
 
-                        # 保存缓存 & README
-                        self.save_cache()
-                        self.generate_readme()
-
-                        # 提示可续期日期
-                        await Notifier.notify(
-                            "ℹ️ 尚未到续期日",
-                            f"当前利用期限: {self.old_expiry_time}\n"
-                            f"可续期开始日: {can_extend_date}"
-                        )
-                        return
-                    else:
-                        logger.info("✅ 已达到可续期日期，继续执行续期流程...")
-                else:
-                    logger.warning("⚠️ 未获取到 old_expiry_time，跳过自动判断逻辑")
-            except Exception as e:
-                logger.error(f"❌ 自动判断是否需要续期失败: {e}")
-
-            # 4. 进入详情页,尝试点击"更新する"
-            await self.page.goto(Config.DETAIL_URL, timeout=Config.WAIT_TIMEOUT)
-            await asyncio.sleep(2)
-            await self.click_update()
-            await asyncio.sleep(3)
-
-            # 5. 打开续期页面
-            opened = await self.open_extend()
-            if not opened and self.renewal_status == "Unexpired":
-                # 未到续期时间
-                self.generate_readme()
-                await Notifier.notify("ℹ️ 尚未到期", f"当前到期时间: {self.old_expiry_time}")
-                return
-            elif not opened:
-                self.renewal_status = "Failed"
-                self.error_message = "无法打开续期页面"
-                self.generate_readme()
-                await Notifier.notify("❌ 续期失败", "无法打开续期页面")
-                return
-
-            # 6. 提交续期
-            await self.submit_extend()
-
-            # 7. 保存缓存 & README & 通知
-            self.save_cache()
-            self.generate_readme()
-
-            if self.renewal_status == "Success":
-                await Notifier.notify("✅ 续期成功", f"续期成功，新到期时间: {self.new_expiry_time}")
-            elif self.renewal_status == "Unexpired":
-                await Notifier.notify("ℹ️ 尚未到期", f"当前到期时间: {self.old_expiry_time}")
-            else:
-                await Notifier.notify("❌ 续期失败", f"错误信息: {self.error_message or '未知错误'}")
-
-        finally:
-            logger.info("=" * 60)
-            logger.info(f"✅ 流程完成 - 状态: {self.renewal_status}")
-            logger.info("=" * 60)
-            # 关闭浏览器 & playwright
-            try:
-                if self.page:
-                    await self.page.close()
-                if self.context:
-                    await self.context.close()
-                if self.browser:
-                    await self.browser.close()
-                if self._pw:
-                    await self._pw.stop()
-                logger.info("🧹 浏览器已关闭")
-            except Exception as e:
-                logger.warning(f"关闭浏览器时出错: {e}")
-
-
-async def main():
-    runner = XServerVPSRenewal()
-    await runner.run()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+                        self.save
