@@ -66,7 +66,7 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
     DETAIL_URL = f"https://secure.xserver.ne.jp/xapanel/xvps/server/detail?id={VPS_ID}"
-    EXTEND_URL = f"https://secure.xserver.ne.jp/xapanel/xvps/server/freevps/extend/index?id_vps={VPS_ID}"
+    EXTEND_URL = f"https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/input"
 
 
 # ======================== 日志 ==========================
@@ -867,104 +867,212 @@ Object.defineProperty(navigator, 'permissions', {
             return False
 
     # ---------- 提交续期表单 ----------
+        # ---------- 提交续期表单（两步确认版） ----------
     async def submit_extend(self) -> bool:
         try:
-            logger.info("📄 开始提交续期表单")
+            logger.info("📄 开始提交续期流程（两步确认）")
             await asyncio.sleep(2)
 
+            # Step 0: Turnstile（如有）
             await self.complete_turnstile_verification(max_wait=90)
             await asyncio.sleep(1)
 
-            logger.info("🔍 查找续期验证码图片...")
-            img_data_url = await self.page.evaluate("""
-                () => {
-                    const img =
-                      document.querySelector('img[src^="data:image"]') ||
-                      document.querySelector('img[src^="data:"]') ||
-                      document.querySelector('img[alt="画像認証"]') ||
-                      document.querySelector('img');
-                    if (!img || !img.src) return null;
-                    return img.src;
-                }
-            """)
+            # Step 1: 点击「+72時間延長」
+            logger.info("🖱️ Step1: 点击「+72時間延長」...")
+            await self.shot("08_before_plus72")
+
+            plus72_clicked = False
+            try:
+                btn = self.page.locator("button:has-text('+72時間延長')").first
+                if await btn.count() > 0:
+                    await btn.click()
+                    plus72_clicked = True
+            except Exception:
+                plus72_clicked = False
+
+            if not plus72_clicked:
+                try:
+                    plus72_clicked = await self.page.evaluate("""
+                        () => {
+                            const btn = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'))
+                                .find(el => (el.innerText || el.value || '').includes('+72') && (el.innerText || el.value || '').includes('延長'));
+                            if (!btn) return false;
+                            btn.click();
+                            return true;
+                        }
+                    """)
+                except Exception:
+                    plus72_clicked = False
+
+            await asyncio.sleep(2)
+            await self.shot("08_after_plus72")
+
+            if not plus72_clicked:
+                self.renewal_status = "Failed"
+                self.error_message = "未能点击「+72時間延長」按钮"
+                logger.error(f"❌ {self.error_message}")
+                return False
+
+            # Step 2: 点击「確認画面に進む」
+            logger.info("🖱️ Step2: 点击「確認画面に進む」进入确认页...")
+            go_confirm_clicked = False
+            try:
+                btn2 = self.page.locator("button:has-text('確認画面に進む'), a:has-text('確認画面に進む')").first
+                if await btn2.count() > 0:
+                    await btn2.click()
+                    go_confirm_clicked = True
+            except Exception:
+                go_confirm_clicked = False
+
+            if not go_confirm_clicked:
+                try:
+                    go_confirm_clicked = await self.page.evaluate("""
+                        () => {
+                            const el = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'))
+                                .find(x => (x.innerText || x.value || '').includes('確認画面に進む'));
+                            if (!el) return false;
+                            el.click();
+                            return true;
+                        }
+                    """)
+                except Exception:
+                    go_confirm_clicked = False
+
+            await asyncio.sleep(3)
+            await self.shot("09_confirm_page")
+
+            if not go_confirm_clicked:
+                self.renewal_status = "Failed"
+                self.error_message = "未能点击「確認画面に進む」按钮"
+                logger.error(f"❌ {self.error_message}")
+                return False
+
+            # Step 3: 确认页通常会出现图片验证码（画像認証）——在确认页再找
+            logger.info("🔍 Step3: 在确认页查找图片验证码...")
+            img_data_url = None
+            try:
+                img_data_url = await self.page.evaluate("""
+                    () => {
+                        const img =
+                          document.querySelector('img[src^="data:image"]') ||
+                          document.querySelector('img[src^="data:"]') ||
+                          document.querySelector('img[alt="画像認証"]') ||
+                          document.querySelector('img');
+                        if (!img || !img.src) return null;
+                        return img.src;
+                    }
+                """)
+            except Exception:
+                img_data_url = None
 
             if not img_data_url:
-                logger.info("ℹ️ 未找到验证码图片（可能未到续期窗口）")
-                self.renewal_status = "Unexpired"
-                return False
+                # 有些情况下确认页可能没验证码（或验证码不在 img data url），这里给出明确日志与截图
+                logger.warning("⚠️ 确认页未检测到验证码图片（img.src），将继续尝试直接提交")
+                await self.shot("09_no_captcha_found")
 
-            await self.shot("08_captcha_found")
+            code = None
+            if img_data_url:
+                await self.shot("10_captcha_found")
+                code = await self.captcha_solver.solve(img_data_url)
+                if not code:
+                    self.renewal_status = "Failed"
+                    self.error_message = "确认页验证码识别失败"
+                    logger.error(f"❌ {self.error_message}")
+                    return False
 
-            code = await self.captcha_solver.solve(img_data_url)
-            if not code:
-                self.renewal_status = "Failed"
-                self.error_message = "续期验证码识别失败"
-                logger.error(f"❌ {self.error_message}")
-                return False
+                logger.info(f"⌨️ Step4: 填写确认页验证码: {code}")
+                filled = False
+                try:
+                    filled = await self.page.evaluate("""
+                        (code) => {
+                            const input =
+                              document.querySelector('[placeholder*="上の画像"]') ||
+                              document.querySelector('input[type="text"]');
+                            if (!input) return false;
+                            input.value = code;
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                    """, code)
+                except Exception:
+                    filled = False
 
-            logger.info(f"⌨️ 填写续期验证码: {code}")
-            filled = await self.page.evaluate("""
-                (code) => {
-                    const input =
-                      document.querySelector('[placeholder*="上の画像"]') ||
-                      document.querySelector('input[type="text"]');
-                    if (!input) return false;
-                    input.value = code;
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
-                    return true;
-                }
-            """, code)
+                await asyncio.sleep(1)
+                await self.shot("10_captcha_filled")
 
-            if not filled:
-                self.renewal_status = "Failed"
-                self.error_message = "未找到续期验证码输入框"
-                logger.error(f"❌ {self.error_message}")
-                return False
+                if not filled:
+                    self.renewal_status = "Failed"
+                    self.error_message = "确认页未找到验证码输入框"
+                    logger.error(f"❌ {self.error_message}")
+                    return False
 
-            await asyncio.sleep(1)
-            await self.shot("09_captcha_filled")
+            # Step 5: 最终提交（确认页的“延長する/確定/送信/更新/申請”之类按钮）
+            logger.info("🖱️ Step5: 最终提交续期...")
+            await self.shot("11_before_final_submit")
 
-            logger.info("🖱️ 提交续期表单...")
-            await self.shot("10_before_submit")
-            submitted = await self.page.evaluate("""
-                () => {
-                    if (typeof window.submit_button !== 'undefined' &&
-                        window.submit_button &&
-                        typeof window.submit_button.click === 'function') {
-                        window.submit_button.click();
-                        return true;
-                    }
-                    const submitBtn = document.querySelector('input[type="submit"], button[type="submit"]');
-                    if (submitBtn) { submitBtn.click(); return true; }
-                    return false;
-                }
-            """)
+            submitted = False
+            try:
+                btn3 = self.page.locator(
+                    "button:has-text('延長'), button:has-text('確定'), button:has-text('送信'), "
+                    "button:has-text('更新'), button:has-text('申請'), input[type='submit'], button[type='submit']"
+                ).first
+                if await btn3.count() > 0:
+                    await btn3.click()
+                    submitted = True
+            except Exception:
+                submitted = False
+
+            if not submitted:
+                try:
+                    submitted = await self.page.evaluate("""
+                        () => {
+                            const keywords = ['延長', '確定', '送信', '更新', '申請', '実行', '完了'];
+                            const el = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a'))
+                              .find(x => {
+                                const t = (x.innerText || x.value || '').trim();
+                                return keywords.some(k => t.includes(k));
+                              });
+                            if (!el) return false;
+                            el.click();
+                            return true;
+                        }
+                    """)
+                except Exception:
+                    submitted = False
 
             if not submitted:
                 self.renewal_status = "Failed"
-                self.error_message = "无法提交续期表单"
+                self.error_message = "无法点击确认页最终提交按钮"
                 logger.error(f"❌ {self.error_message}")
                 return False
 
-            await asyncio.sleep(5)
-            await self.shot("11_after_submit")
+            await asyncio.sleep(6)
+            await self.shot("12_after_final_submit")
 
             html = await self.page.content()
+            page_text = ""
+            try:
+                page_text = await self.page.evaluate("() => (document.body.innerText || '')")
+            except Exception:
+                page_text = ""
 
+            # 错误提示（验证码错误/失败）
             if any(err in html for err in [
                 "入力された認証コードが正しくありません",
                 "認証コードが正しくありません",
                 "エラー",
                 "間違"
-            ]):
+            ]) or ("認証コード" in page_text and ("正しく" in page_text or "間違" in page_text)):
                 self.renewal_status = "Failed"
-                self.error_message = "续期验证码错误或 Turnstile 验证失败"
+                self.error_message = "确认页验证码错误或验证失败"
                 logger.error(f"❌ {self.error_message}")
-                await self.shot("11_error")
+                await self.shot("12_error")
                 return False
 
-            if any(success in html for success in ["完了", "継続", "完成", "更新しました"]):
+            # 成功提示（页面关键字兜底）
+            if any(success in html for success in ["完了", "延長しました", "更新しました", "継続"] ) or \
+               any(success in page_text for success in ["完了", "延長しました", "更新しました", "継続"]):
                 logger.info("🎉 续期成功")
                 self.renewal_status = "Success"
                 await self.get_expiry()
@@ -972,7 +1080,7 @@ Object.defineProperty(navigator, 'permissions', {
                 return True
 
             self.renewal_status = "Unknown"
-            logger.warning("⚠️ 续期提交结果未知（页面未匹配成功/失败关键字）")
+            logger.warning("⚠️ 最终提交后未匹配到成功/失败关键字（请查看截图）")
             return False
 
         except Exception as e:
@@ -980,6 +1088,7 @@ Object.defineProperty(navigator, 'permissions', {
             self.error_message = str(e)
             logger.error(f"❌ 续期错误: {e}")
             return False
+
 
     # ---------- README 生成 ----------
     def generate_readme(self):
