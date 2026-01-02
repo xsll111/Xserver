@@ -95,6 +95,12 @@ jobs:
           fi
 
       # ========== 🚀 执行阶段 ==========
+      - name: 🌍 显示 Runner 出口 IP（对比用）
+        run: |
+          echo "🌍 GitHub Runner 出口 IP:"
+          curl -s https://api.ipify.org || true
+          echo ""
+
       - name: 🎯 运行续期脚本
         env:
           # 🔐 账号信息
