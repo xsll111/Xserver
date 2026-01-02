@@ -106,6 +106,12 @@ jobs:
           XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
           XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
           XSERVER_VPS_ID: ${{ secrets.XSERVER_VPS_ID }}
+          # 📧 邮箱验证码（Outlook IMAP）
+          MAIL_IMAP_HOST: ${{ secrets.MAIL_IMAP_HOST }}
+          MAIL_IMAP_USER: ${{ secrets.MAIL_IMAP_USER }}
+          MAIL_IMAP_PASS: ${{ secrets.MAIL_IMAP_PASS }}
+          MAIL_FROM_FILTER: ${{ secrets.MAIL_FROM_FILTER }}
+          MAIL_SUBJECT_FILTER: ${{ secrets.MAIL_SUBJECT_FILTER }}
 
           # 🌐 代理（Secrets）
           PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
