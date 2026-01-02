@@ -3,13 +3,16 @@
 
 """
 XServer VPS 自动续期脚本（方案 C：清理旧未读邮件 + 自动收 Outlook 邮箱验证码）
-- 登录如遇“新环境登录验证”，自动点发送验证码 → IMAP 拉取邮件 → 自动回填验证码
+改动点（按你的要求）：
+- 登录页固定为：https://secure.xserver.ne.jp/xapanel/login/xvps/
+- 登录成功后，直接访问续期入口页：
+    https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/index
+- 续期流程只保留这两个按钮步骤：
+    1) 点击「期限を延長する」
+    2) 点击「期限を延長する」（确认页第二次确认）
+  （也就是你说的“网页只需要保留这两个”）
 - 方案C关键：点击“发送验证码”前，先把旧的“验证码相关未读邮件”全部标为已读（Seen），避免读到旧验证码
-- 解决 Outlook IMAP 搜索 ascii 报错：如果 SUBJECT 过滤包含非 ASCII（如日文），自动跳过该过滤
-- 续期地址已改为你提供的：https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/input
-- 续期两次确认：
-    1) 点击「確認画面に進む」
-    2) 点击「期限を延長する」
+- 解决 Outlook IMAP 搜索 ascii 报错：如果 SUBJECT/FROM 过滤包含非 ASCII（如日文），自动跳过该过滤
 """
 
 import asyncio
@@ -19,8 +22,7 @@ import json
 import logging
 import os
 import re
-from typing import Optional, Dict, List, Tuple
-from urllib.parse import urlparse
+from typing import Optional, Dict, List
 
 from playwright.async_api import async_playwright
 
@@ -28,7 +30,6 @@ from playwright.async_api import async_playwright
 # ======================== stealth（可选） ==========================
 
 try:
-    # 老版本
     from playwright_stealth import stealth_async  # type: ignore
     STEALTH_VERSION = "old"
 except Exception:
@@ -48,26 +49,26 @@ class Config:
     USE_HEADLESS = os.getenv("USE_HEADLESS", "false").lower() == "true"
     WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", "30000"))
 
-    # 代理（你现在不需要全程代理，所以这里仅保留变量/提示，不用于 launch）
+    # 代理（保留变量提示，不用于 launch）
     PROXY_SERVER = os.getenv("PROXY_SERVER")
     RUNNER_IP = os.getenv("RUNNER_IP")
 
     # 邮箱验证码（Outlook IMAP）
     MAIL_IMAP_HOST = os.getenv("MAIL_IMAP_HOST")            # imap-mail.outlook.com / outlook.office365.com
-    MAIL_IMAP_USER = os.getenv("MAIL_IMAP_USER")            # 你的邮箱地址
-    MAIL_IMAP_PASS = os.getenv("MAIL_IMAP_PASS")            # App Password（推荐）或 OAuth（此脚本不做）
-    MAIL_FROM_FILTER = os.getenv("MAIL_FROM_FILTER", "").strip()        # support@xserver.ne.jp
+    MAIL_IMAP_USER = os.getenv("MAIL_IMAP_USER")            # 邮箱地址
+    MAIL_IMAP_PASS = os.getenv("MAIL_IMAP_PASS")            # App Password（推荐）
+    MAIL_FROM_FILTER = os.getenv("MAIL_FROM_FILTER", "").strip()
     MAIL_SUBJECT_FILTER = os.getenv("MAIL_SUBJECT_FILTER", "").strip()  # 建议留空（日文会触发 ascii 报错）
 
     # Telegram（可选）
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-    # 登录页
+    # ✅ 登录页（按你要求）
     LOGIN_URL = "https://secure.xserver.ne.jp/xapanel/login/xvps/"
 
-    # 你确认的续期地址（xmgame）
-    EXTEND_URL = "https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/input"
+    # ✅ 登录后直接访问的续期入口（按你要求）
+    EXTEND_INDEX_URL = "https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/index"
 
     # 旧版 xvps 到期详情（保留，用于读取到期日）
     DETAIL_URL = f"https://secure.xserver.ne.jp/xapanel/xvps/server/detail?id={VPS_ID}"
@@ -118,7 +119,7 @@ class EmailCodeFetcher:
     """
     通过 IMAP 拉取邮箱验证码（用于“新环境登录验证”）
     - 方案C：在点击“发送验证码”之前，先把匹配条件的旧 UNSEEN 全部标记为 Seen，避免读到旧码
-    - 注意：Outlook 个人账号 IMAP 对 Basic Auth 可能会限制；你现在已经能拿到码，说明可用
+    - 解决 Outlook IMAP search 的 ascii 报错：SUBJECT/FROM 含非 ASCII 时跳过该过滤
     """
 
     def __init__(self):
@@ -139,11 +140,9 @@ class EmailCodeFetcher:
     def _extract_code(self, text: str) -> Optional[str]:
         if not text:
             return None
-        # 先抓 5~6 位（你截图/日志里是 5 位）
         m = re.search(r"\b(\d{5,6})\b", text)
         if m:
             return m.group(1)
-        # 兜底
         m = re.search(r"\b(\d{4,8})\b", text)
         return m.group(1) if m else None
 
@@ -183,11 +182,6 @@ class EmailCodeFetcher:
         return f"SUBJECT:\n{subject}\n\nFROM:\n{from_}\n\nBODY:\n{combined}"
 
     def _build_search_criteria(self) -> List[str]:
-        """
-        IMAP SEARCH 的参数必须是 ASCII，否则会报 'ascii' codec can't encode...
-        - FROM 一般是 ASCII：OK
-        - SUBJECT 如果你填了日文，会触发报错：这里自动跳过并提示
-        """
         criteria: List[str] = ["UNSEEN"]
 
         if self.from_filter:
@@ -205,9 +199,6 @@ class EmailCodeFetcher:
         return criteria
 
     def mark_old_unseen_as_seen(self) -> None:
-        """
-        方案C核心：清掉旧的未读验证码邮件，避免拿到旧验证码
-        """
         if not all([self.host, self.user, self.password]):
             logger.warning("⚠️ 未配置 MAIL_IMAP_*，无法清理旧未读验证码邮件")
             return
@@ -232,7 +223,6 @@ class EmailCodeFetcher:
                 logger.info("🧹 清理阶段：没有旧的未读验证码邮件")
                 return
 
-            # 全部标为已读
             for mid in ids:
                 try:
                     mail.store(mid, "+FLAGS", "\\Seen")
@@ -246,9 +236,6 @@ class EmailCodeFetcher:
             logger.warning(f"⚠️ 清理旧未读验证码邮件失败（将继续尝试正常收码）: {e}")
 
     def fetch_latest_code(self, timeout_sec: int = 120, poll_interval: int = 5) -> Optional[str]:
-        """
-        轮询获取“新来的未读验证码邮件”
-        """
         if not all([self.host, self.user, self.password]):
             logger.warning("⚠️ 未配置 MAIL_IMAP_*，无法自动收取邮箱验证码")
             return None
@@ -279,7 +266,6 @@ class EmailCodeFetcher:
                     time.sleep(poll_interval)
                     continue
 
-                # 取最新一封
                 latest_id = ids[-1]
                 typ, msg_data = mail.fetch(latest_id, "(RFC822)")
                 if typ != "OK":
@@ -297,7 +283,6 @@ class EmailCodeFetcher:
                     logger.info(f"✅ 邮箱验证码获取成功: {code}")
                     return code
 
-                # 没提取到就也标记已读，避免一直卡住同一封
                 mail.store(latest_id, "+FLAGS", "\\Seen")
                 mail.logout()
                 logger.info("📩 收到新邮件但未提取到验证码，已标记已读，继续等待...")
@@ -469,8 +454,8 @@ Object.defineProperty(navigator, 'permissions', {
 
             current_url = self.page.url
 
-            # 登录成功判定
-            if "xvps/index" in current_url or ("login" not in current_url.lower()):
+            # 登录成功判定（更宽松：只要不在 login 页面就算进去了）
+            if ("login" not in current_url.lower()):
                 logger.info("🎉 登录成功")
                 return True
 
@@ -495,8 +480,7 @@ Object.defineProperty(navigator, 'permissions', {
 
             logger.warning("🔐 检测到“新环境登录验证/邮箱验证码”页面，尝试自动发送验证码并收码...")
 
-            # ===== 方案C：先清理旧未读验证码邮件（关键）=====
-            # 注意：清理必须发生在“发送验证码”之前
+            # ✅ 方案C：先清理旧未读验证码邮件（必须在发送之前）
             self.email_fetcher.mark_old_unseen_as_seen()
 
             # 1) 点击“发送验证码”
@@ -593,7 +577,7 @@ Object.defineProperty(navigator, 'permissions', {
             await self.shot("03e_after_verify_submit")
 
             current_url = self.page.url
-            if "xvps/index" in current_url or ("login" not in current_url.lower()):
+            if "login" not in current_url.lower():
                 logger.info("🎉 邮箱验证通过，登录成功")
                 return True
 
@@ -654,72 +638,60 @@ Object.defineProperty(navigator, 'permissions', {
             logger.error(f"❌ 获取到期时间失败: {e}")
             return False
 
-    # ---------- 续期：两次确认（xmgame/freeplan） ----------
-    async def extend_two_step_confirm(self) -> bool:
+    # ---------- 续期：只保留「期限を延長する」两次点击 ----------
+    async def extend_two_click_only(self) -> bool:
         """
-        你截图的流程：
-          1) 点「確認画面に進む」
-          2) 再点「期限を延長する」
+        按你的要求：
+        - 登录后直接访问 EXTEND_INDEX_URL
+        - 页面只保留这两个步骤：
+            1) 点击「期限を延長する」
+            2) 点击「期限を延長する」（确认页）
         """
         try:
-            logger.info(f"🌐 打开续期页面: {Config.EXTEND_URL}")
-            await self.page.goto(Config.EXTEND_URL, timeout=Config.WAIT_TIMEOUT)
+            logger.info(f"🌐 打开续期入口页: {Config.EXTEND_INDEX_URL}")
+            await self.page.goto(Config.EXTEND_INDEX_URL, timeout=Config.WAIT_TIMEOUT)
             await asyncio.sleep(2)
-            await self.shot("05_extend_input")
+            await self.shot("05_extend_index")
 
-            # 第一步：找到「確認画面に進む」
-            step1 = self.page.locator(
-                "button:has-text('確認画面に進む'), a:has-text('確認画面に進む'), input[type='submit'][value*='確認']"
+            # Step 1: 点击「期限を延長する」
+            step = self.page.locator(
+                "button:has-text('期限を延長する'), a:has-text('期限を延長する'), input[type='submit'][value*='延長']"
             ).first
 
-            # 有些页面会显示 “+72時間延長” 等提示按钮
-            # 当前策略：不主动点击，直接进入后续确认流程
-            try:
-                has_plus72 = await self.page.locator(
-                    "button:has-text('+72'), a:has-text('+72'), button:has-text('72'), a:has-text('72')"
-                ).count()
-                if has_plus72 > 0:
-                    logger.info("ℹ️ 检测到 '+72時間延長' 提示，但当前策略不点击，直接继续")
-                    await self.shot("05a_plus72_detected_but_skipped")
-            except Exception:
-                pass
+            if await step.count() == 0:
+                # 兜底：只要包含“延長”
+                step = self.page.locator("button:has-text('延長'), a:has-text('延長')").first
 
-            if await step1.count() == 0:
-                # 再兜底：页面上所有按钮里找“確認”
-                step1 = self.page.locator("button:has-text('確認'), a:has-text('確認')").first
-
-            if await step1.count() == 0:
-                self.error_message = "续期失败：未找到「確認画面に進む/確認」按钮"
+            if await step.count() == 0:
+                self.error_message = "续期失败：在入口页未找到「期限を延長する/延長」按钮"
                 logger.error(f"❌ {self.error_message}")
-                await self.shot("05b_no_confirm_button")
+                await self.shot("05b_no_extend_button")
                 return False
 
-            logger.info("🖱️ 续期第1步：点击「確認画面に進む」")
-            await step1.click()
+            logger.info("🖱️ 续期第1步：点击「期限を延長する」")
+            await step.click()
             await asyncio.sleep(2)
-            await self.shot("06_extend_confirm")
+            await self.shot("06_after_extend_click_1")
 
-            # 第二步：点击「期限を延長する」
+            # Step 2: 再次点击「期限を延長する」（确认页）
             step2 = self.page.locator(
                 "button:has-text('期限を延長する'), a:has-text('期限を延長する'), input[type='submit'][value*='延長']"
             ).first
 
             if await step2.count() == 0:
-                # 再兜底：找“延長”
                 step2 = self.page.locator("button:has-text('延長'), a:has-text('延長')").first
 
             if await step2.count() == 0:
-                self.error_message = "续期失败：未找到「期限を延長する/延長」按钮"
+                self.error_message = "续期失败：在确认页未找到第二次「期限を延長する/延長」按钮"
                 logger.error(f"❌ {self.error_message}")
-                await self.shot("06b_no_extend_button")
+                await self.shot("06b_no_extend_button_2")
                 return False
 
-            logger.info("🖱️ 续期第2步：点击「期限を延長する」")
+            logger.info("🖱️ 续期第2步：点击「期限を延長する」（确认页）")
             await step2.click()
             await asyncio.sleep(3)
             await self.shot("07_extend_done")
 
-            # 简单成功判定：页面包含“完了/延長/成功”等
             page_text = ""
             try:
                 page_text = await self.page.evaluate("() => (document.body.innerText || document.body.textContent || '')")
@@ -731,13 +703,12 @@ Object.defineProperty(navigator, 'permissions', {
                 self.renewal_status = "Success"
                 return True
 
-            # 如果没有明显关键字，也当作 Unknown，但不直接失败
             logger.warning("⚠️ 未检测到明确成功关键字，但已完成两次点击（请看截图确认）")
             self.renewal_status = "Unknown"
             return True
 
         except Exception as e:
-            self.error_message = f"续期两次确认流程异常: {e}"
+            self.error_message = f"续期流程异常: {e}"
             logger.error(f"❌ {self.error_message}")
             return False
 
@@ -756,14 +727,14 @@ Object.defineProperty(navigator, 'permissions', {
             out += "## ✅ 续期成功\n\n"
             if self.old_expiry_time:
                 out += f"- 🕛 **到期时间（旧面板读取）**: `{self.old_expiry_time}`\n"
-        elif self.renewal_status == "Unexpired":
-            out += "## ℹ️ 尚未到续期窗口\n\n"
-            out += f"- 🕛 **到期时间**: `{self.old_expiry_time}`\n"
         elif self.renewal_status == "NeedVerify":
             out += "## 🔐 需要邮箱验证/收码失败\n\n"
             out += f"- ⚠️ **原因**: {self.error_message or '未知'}\n"
+        elif self.renewal_status == "Unknown":
+            out += "## ⚠️ 已完成点击但状态不确定\n\n"
+            out += "- 已执行两次「期限を延長する」点击，请查看截图确认页面提示。\n"
         else:
-            out += "## ❌ 续期失败/未知\n\n"
+            out += "## ❌ 续期失败\n\n"
             out += f"- ⚠️ **错误**: {self.error_message or '未知'}\n"
 
         out += f"\n---\n\n*最后更新: {ts}*\n"
@@ -795,11 +766,11 @@ Object.defineProperty(navigator, 'permissions', {
                 await Notifier.notify("❌ 登录失败", self.error_message or "登录失败")
                 return
 
-            # 3) 读取到期日（旧面板）
+            # 3) 读取到期日（可选）
             await self.get_expiry()
 
-            # 4) 续期（两次确认）
-            ok = await self.extend_two_step_confirm()
+            # 4) ✅ 登录成功后直接访问 extend/index 并只做两次「期限を延長する」
+            ok = await self.extend_two_click_only()
             if not ok:
                 self.renewal_status = "Failed"
                 self.generate_readme()
@@ -811,9 +782,11 @@ Object.defineProperty(navigator, 'permissions', {
             self.generate_readme()
 
             if self.renewal_status == "Success":
-                await Notifier.notify("✅ 续期成功", "已完成续期两次确认流程（建议查看截图确认页面提示）")
-            else:
+                await Notifier.notify("✅ 续期成功", "已完成两次「期限を延長する」点击（建议查看截图确认页面提示）")
+            elif self.renewal_status == "Unknown":
                 await Notifier.notify("⚠️ 续期完成但状态不确定", "已完成两次点击，但未匹配到明确成功关键字，请看截图。")
+            else:
+                await Notifier.notify("❌ 续期失败", self.error_message or "未知错误")
 
         finally:
             logger.info("=" * 60)
