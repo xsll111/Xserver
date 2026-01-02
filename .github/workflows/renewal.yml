@@ -95,7 +95,7 @@ jobs:
           fi
 
       # ========== 🚀 执行阶段 ==========
-            - name: 🎯 运行续期脚本
+      - name: 🎯 运行续期脚本
         env:
           # 🔐 账号信息
           XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
