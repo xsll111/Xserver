@@ -672,18 +672,17 @@ Object.defineProperty(navigator, 'permissions', {
                 "button:has-text('確認画面に進む'), a:has-text('確認画面に進む'), input[type='submit'][value*='確認']"
             ).first
 
-            # 有些页面需要先点 “+72時間延長” 或类似按钮，再出现确认按钮
-            plus72 = self.page.locator(
-                "button:has-text('+72'), a:has-text('+72'), button:has-text('72'), a:has-text('72')"
-            ).first
-
-            if await plus72.count() > 0:
-                try:
-                    await plus72.click(timeout=1500)
-                    await asyncio.sleep(1)
-                    await self.shot("05a_clicked_plus72")
-                except Exception:
-                    pass
+            # 有些页面会显示 “+72時間延長” 等提示按钮
+            # 当前策略：不主动点击，直接进入后续确认流程
+            try:
+                has_plus72 = await self.page.locator(
+                    "button:has-text('+72'), a:has-text('+72'), button:has-text('72'), a:has-text('72')"
+                ).count()
+                if has_plus72 > 0:
+                    logger.info("ℹ️ 检测到 '+72時間延長' 提示，但当前策略不点击，直接继续")
+                    await self.shot("05a_plus72_detected_but_skipped")
+            except Exception:
+                pass
 
             if await step1.count() == 0:
                 # 再兜底：页面上所有按钮里找“確認”
