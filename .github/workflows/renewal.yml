@@ -16,16 +16,12 @@ on:
           - 'false'
           - 'true'
 
-# 关键：允许 workflow 最后 git push 回仓库
-permissions:
-  contents: write
-
 jobs:
   renewal:
     name: 🔄 执行续期任务
     runs-on: ubuntu-latest
 
-    # ========== 🔧 FlareSolverr 服务容器 ==========
+    # ========== 🔧 关键：添加 FlareSolverr 服务容器 ==========
     services:
       flaresolverr:
         image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -37,6 +33,7 @@ jobs:
 
     steps:
       # ========== 📦 准备阶段 ==========
+
       - name: 📥 检出代码仓库
         uses: actions/checkout@v4
         with:
@@ -52,7 +49,7 @@ jobs:
       - name: 📦 安装 Python 依赖
         run: |
           echo "📦 正在安装 Python 依赖..."
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install -r requirements.txt
           echo "✅ Python 依赖安装完成"
 
@@ -62,11 +59,6 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
           echo "✅ 浏览器安装完成"
-
-      - name: 🖥️ 安装 Xvfb（支持非无头浏览器）
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
 
       # ========== 🧪 测试 FlareSolverr 连接 ==========
       - name: 🔍 测试 FlareSolverr 服务
@@ -94,12 +86,19 @@ jobs:
             exit 1
           fi
 
-      # ========== 🚀 执行阶段 ==========
-      - name: 🌍 显示 Runner 出口 IP（对比用）
+      # ========== 🌍 获取 Runner 出口 IP（用于检测代理是否生效） ==========
+      - name: 🌍 获取 GitHub Runner 出口 IP（用于检测代理是否生效）
         run: |
-          echo "🌍 GitHub Runner 出口 IP:"
-          curl -s https://api.ipify.org || true
-          echo ""
+          echo "🌍 获取 GitHub Runner 出口 IP..."
+          RUNNER_IP="$(curl -fsS https://api.ipify.org || true)"
+          if [ -z "$RUNNER_IP" ]; then
+            echo "⚠️ 获取 RUNNER_IP 失败，将跳过代理强校验"
+          else
+            echo "✅ RUNNER_IP: $RUNNER_IP"
+            echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
+          fi
+
+      # ========== 🚀 执行阶段 ==========
 
       - name: 🎯 运行续期脚本
         env:
@@ -108,13 +107,16 @@ jobs:
           XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
           XSERVER_VPS_ID: ${{ secrets.XSERVER_VPS_ID }}
 
-          # 🌐 代理（从 Secrets 读取）
+          # 🌐 代理（Secrets）
           PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
 
-          # 🔧 FlareSolverr 配置
+          # ✅ Runner 出口 IP（上一步写入 GITHUB_ENV）
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+
+          # 🔧 FlareSolverr 配置（使用本地服务）
           FLARESOLVERR_URL: 'http://localhost:8191/v1'
 
-          # 🤖 验证码识别 API（为空则使用脚本默认值）
+          # 🤖 验证码识别 API
           CAPTCHA_API_URL: ${{ secrets.CAPTCHA_API_URL }}
 
           # 📱 Telegram 通知
@@ -134,6 +136,7 @@ jobs:
           if [ -n "$XSERVER_PASSWORD" ]; then echo "  ✅ XSERVER_PASSWORD: 已配置"; else echo "  ❌ XSERVER_PASSWORD: 未配置"; fi
           if [ -n "$XSERVER_VPS_ID" ]; then echo "  ✅ XSERVER_VPS_ID: 已配置"; else echo "  ❌ XSERVER_VPS_ID: 未配置"; fi
           if [ -n "$PROXY_SERVER" ]; then echo "  ✅ PROXY_SERVER: 已配置"; else echo "  ⚠️ PROXY_SERVER: 未配置"; fi
+          if [ -n "$RUNNER_IP" ]; then echo "  ✅ RUNNER_IP: $RUNNER_IP"; else echo "  ⚠️ RUNNER_IP: 未获取到"; fi
           if [ -n "$CAPTCHA_API_URL" ]; then echo "  ✅ CAPTCHA_API_URL: 已配置"; else echo "  ⚠️ CAPTCHA_API_URL: 未配置(将使用脚本默认值)"; fi
           if [ -n "$FLARESOLVERR_URL" ]; then echo "  ✅ FlareSolverr: $FLARESOLVERR_URL"; else echo "  ❌ FlareSolverr: 未配置"; fi
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -146,56 +149,52 @@ jobs:
           echo "📂 当前目录: $(pwd)"
           ls -lh renewal.py
 
+          # 关键：在虚拟显示器里运行，满足 headless=False
           xvfb-run -a python3 renewal.py
 
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "✅ 续期任务执行完成"
 
-
       # ========== 📊 结果处理 ==========
-      - name: 📊 显示运行结果
+      - name: 📊 显示运行结果（含 Artifact 获取提示）
         if: always()
         run: |
           echo "📊 ========== 运行结果摘要 =========="
-          if [ -f "README.md" ]; then cat README.md; fi
+          if [ -f "README.md" ]; then
+            echo "📄 README.md:"
+            cat README.md
+          else
+            echo "⚠️ 未找到 README.md"
+          fi
           echo ""
-          if [ -f "cache.json" ]; then cat cache.json | python3 -m json.tool; fi
+
+          if [ -f "cache.json" ]; then
+            echo "🗃️ cache.json:"
+            cat cache.json | python3 -m json.tool
+          else
+            echo "ℹ️ 未生成 cache.json"
+          fi
           echo ""
-          echo "📝 最新日志:"
-          if [ -f "renewal.log" ]; then tail -n 100 renewal.log; fi
+
+          echo "📝 最新日志(最后 120 行):"
+          if [ -f "renewal.log" ]; then
+            tail -n 120 renewal.log
+          else
+            echo "⚠️ 未找到 renewal.log"
+          fi
+          echo ""
+          echo "📦 若 Playwright 崩溃 / 需要截图排查：请在本次 Run 页面顶部找到 Artifacts 下载 renewal-logs-<run_number>"
 
       - name: 📦 上传运行日志与截图（Artifacts）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xserver-renewal-artifacts-run-${{ github.run_number }}
+          name: renewal-logs-${{ github.run_number }}
           path: |
             renewal.log
             *.png
             cache.json
-            README.md
-          if-no-files-found: warn
           retention-days: 30
-
-      - name: 🔗 打开本次运行的 Artifacts（醒目链接）
-        if: always()
-        run: |
-          echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📦 Artifacts 已上传（如果有文件的话）"
-          echo ""
-          echo "👉 直达本次 Run 页面（在页面底部找到 Artifacts 下载）："
-          echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo ""
-          echo "📁 本次生成的文件清单（用于确认是否有截图/日志）："
-          ls -lah || true
-          echo ""
-          echo "🖼️ 截图文件："
-          ls -lah *.png 2>/dev/null || echo "（没有生成截图）"
-          echo ""
-          echo "📝 日志文件："
-          ls -lah renewal.log 2>/dev/null || echo "（没有生成 renewal.log）"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: 💾 提交状态更新
         if: always()
