@@ -3,7 +3,7 @@ name: 🚀 XServer VPS 自动续期
 on:
   schedule:
     # 每72小时运行一次（每3天的 00:00 UTC，即北京时间 08:00）
-    - cron: '0 0 */3 * *'
+    - cron: '0 17 */3 * *'
 
   workflow_dispatch:
     inputs:
