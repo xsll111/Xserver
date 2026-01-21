@@ -1,8 +1,8 @@
 {
-  "last_expiry": "2026-01-19",
+  "last_expiry": "2026-01-23",
   "status": "Success",
-  "last_check": "2026-01-18T23:03:42.290028+00:00",
+  "last_check": "2026-01-21T17:30:53.837888+00:00",
   "vps_id": "40139481",
-  "browser_exit_ip": "20.168.119.17",
-  "runner_ip": "20.168.119.17"
+  "browser_exit_ip": "52.154.20.57",
+  "runner_ip": "52.154.20.57"
 }
