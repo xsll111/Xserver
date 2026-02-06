@@ -1,33 +1,16 @@
 # XServer VPS 自动续期状态
 
-**运行时间**: `2026-02-05 01:53:06 (UTC+8)`<br>
-**VPS ID**: `40139481`<br>
-**Runner IP**: `172.182.209.57`<br>
-**浏览器出口 IP**: `172.182.209.57`<br>
+**运行时间**: `2026-02-06 08:43:43 (UTC+8)`<br>
+**VPS ID**: `40146909`<br>
+**Runner IP**: `172.200.183.244`<br>
+**浏览器出口 IP**: `172.200.183.244`<br>
 
 ---
 
-## ❌ 续期失败
+## ✅ 续期成功
 
-- ⚠️ **错误**: 续期流程异常: Locator.click: Timeout 30000ms exceeded.
-Call log:
-  - waiting for locator("button:has-text('確認'), a:has-text('確認')").first
-    - locator resolved to <a href="/xapanel/myaccount/account/index">登録情報確認・編集</a>
-  - attempting click action
-    2 × waiting for element to be visible, enabled and stable
-      - element is not visible
-    - retrying click action
-    - waiting 20ms
-    2 × waiting for element to be visible, enabled and stable
-      - element is not visible
-    - retrying click action
-      - waiting 100ms
-    58 × waiting for element to be visible, enabled and stable
-       - element is not visible
-     - retrying click action
-       - waiting 500ms
-
+- 🕛 **到期时间（旧面板读取）**: `2026-02-07`
 
 ---
 
-*最后更新: 2026-02-05 01:53:06*
+*最后更新: 2026-02-06 08:43:43*
